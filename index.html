@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1.1 · cloud sync</div>
+      <div class="subtitle">v1.2 · cloud sync</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -411,6 +411,8 @@
     function waitForPlayableAt(targetTimeSec, timeoutMs = SEEK_PLAYABLE_TIMEOUT_MS){
       return new Promise(resolve=>{
         const startedAt = highResNowMs();
+        let interval = null;
+        let finished = false;
 
         function isPlayable(){
           if(audio.readyState >= 3) return true;
@@ -419,44 +421,51 @@
           return bufferedEnd > targetTimeSec + LATE_JOIN_BUFFER_SEC;
         }
 
-        if(isPlayable()){
-          cleanup();
-          resolve(true);
-          return;
-        }
-
-        const interval = setInterval(()=>{
-          if(isPlayable()){
-            cleanup();
-            resolve(true);
-            return;
-          }
-
-          if(highResNowMs() - startedAt >= timeoutMs){
-            cleanup();
-            resolve(false);
-          }
-        }, 200);
-
-        function onPlayable(){
-          if(isPlayable()){
-            cleanup();
-            resolve(true);
-          }
-        }
-
         function cleanup(){
-          clearInterval(interval);
+          if(interval){
+            clearInterval(interval);
+            interval = null;
+          }
+
           audio.removeEventListener("canplay", onPlayable);
           audio.removeEventListener("canplaythrough", onPlayable);
           audio.removeEventListener("progress", onPlayable);
           audio.removeEventListener("loadeddata", onPlayable);
         }
 
+        function finish(value){
+          if(finished) return;
+          finished = true;
+          cleanup();
+          resolve(value);
+        }
+
+        function onPlayable(){
+          if(isPlayable()){
+            finish(true);
+          }
+        }
+
+        if(isPlayable()){
+          finish(true);
+          return;
+        }
+
         audio.addEventListener("canplay", onPlayable);
         audio.addEventListener("canplaythrough", onPlayable);
         audio.addEventListener("progress", onPlayable);
         audio.addEventListener("loadeddata", onPlayable);
+
+        interval = setInterval(()=>{
+          if(isPlayable()){
+            finish(true);
+            return;
+          }
+
+          if(highResNowMs() - startedAt >= timeoutMs){
+            finish(false);
+          }
+        }, 200);
       });
     }
 
@@ -606,13 +615,6 @@
 
       audio.pause();
       resetPlaybackRate();
-
-      /*
-        Late-join fix:
-        For already-running pieces, seek first. This forces the browser,
-        especially mobile Safari/Chrome, to request audio around the correct
-        timestamp instead of slowly buffering from the beginning.
-      */
 
       const isLateJoin = offsetSec >= 1;
 
