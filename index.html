@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1 · cloud sync</div>
+      <div class="subtitle">v1.1 · cloud sync</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -171,19 +171,10 @@
     let serverClockOffsetMs = 0;
     let lastClockSyncDebug = "";
 
-    /*
-      ROUND 3: CLOUDFLARE CLOCK SYNC + STABILITY-FIRST AUDIO
-
-      Strategy:
-      - Ask a Cloudflare Worker for server time.
-      - Estimate network round-trip time.
-      - Calculate this device's offset from Cloudflare time.
-      - Use syncedNowMs() for scheduling and drift calculations.
-      - Keep the stability-first audio strategy from Round 2:
-        no continuous playbackRate changes, only hard seeks if drift is large.
-    */
-
     const START_BUFFER_SEC = 15;
+    const LATE_JOIN_BUFFER_SEC = 1.0;
+    const SEEK_PLAYABLE_TIMEOUT_MS = 12000;
+
     const READINESS_CHECK_MS = 500;
     const DRIFT_CHECK_MS = 2000;
     const TRANSPORT_UPDATE_MS = 1000;
@@ -197,73 +188,6 @@
 
     function syncedNowMs(){
       return highResNowMs() + serverClockOffsetMs;
-    }
-
-    async function syncServerClock(samples = 5){
-      /*
-        We take several samples and keep the one with the lowest round-trip time.
-        That is usually the cleanest estimate of server time.
-      */
-
-      let bestSample = null;
-
-      for(let i = 0; i < samples; i++){
-        try{
-          const t0 = highResNowMs();
-
-          const response = await fetch(TIME_SERVER_URL, {
-            cache: "no-store"
-          });
-
-          if(!response.ok){
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const data = await response.json();
-          const t1 = highResNowMs();
-
-          if(typeof data.now !== "number"){
-            throw new Error("Bad time response");
-          }
-
-          const roundTripMs = t1 - t0;
-          const estimatedServerNow = data.now + (roundTripMs / 2);
-          const offsetMs = estimatedServerNow - t1;
-
-          const sample = {
-            offsetMs,
-            roundTripMs
-          };
-
-          if(!bestSample || sample.roundTripMs < bestSample.roundTripMs){
-            bestSample = sample;
-          }
-        }catch(err){
-          if(i === samples - 1 && !bestSample){
-            serverClockOffsetMs = 0;
-            lastClockSyncDebug = `Clock sync failed: ${err.message}`;
-            setDebug(lastClockSyncDebug);
-            return false;
-          }
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 80));
-      }
-
-      if(bestSample){
-        serverClockOffsetMs = bestSample.offsetMs;
-
-        lastClockSyncDebug =
-          `Clock offset ${Math.round(serverClockOffsetMs)} ms · RTT ${Math.round(bestSample.roundTripMs)} ms`;
-
-        setDebug(lastClockSyncDebug);
-        return true;
-      }
-
-      serverClockOffsetMs = 0;
-      lastClockSyncDebug = "Clock sync unavailable; using device clock.";
-      setDebug(lastClockSyncDebug);
-      return false;
     }
 
     function setStatus(msg){
@@ -376,6 +300,68 @@
         `${formatClockTime(current)} / ${formatClockTime(duration)} · drift ${driftMs} ms`;
     }
 
+    async function syncServerClock(samples = 5){
+      let bestSample = null;
+
+      for(let i = 0; i < samples; i++){
+        try{
+          const t0 = highResNowMs();
+
+          const response = await fetch(TIME_SERVER_URL, {
+            cache: "no-store"
+          });
+
+          if(!response.ok){
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const data = await response.json();
+          const t1 = highResNowMs();
+
+          if(typeof data.now !== "number"){
+            throw new Error("Bad time response");
+          }
+
+          const roundTripMs = t1 - t0;
+          const estimatedServerNow = data.now + (roundTripMs / 2);
+          const offsetMs = estimatedServerNow - t1;
+
+          const sample = {
+            offsetMs,
+            roundTripMs
+          };
+
+          if(!bestSample || sample.roundTripMs < bestSample.roundTripMs){
+            bestSample = sample;
+          }
+        }catch(err){
+          if(i === samples - 1 && !bestSample){
+            serverClockOffsetMs = 0;
+            lastClockSyncDebug = `Clock sync failed: ${err.message}`;
+            setDebug(lastClockSyncDebug);
+            return false;
+          }
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 80));
+      }
+
+      if(bestSample){
+        serverClockOffsetMs = bestSample.offsetMs;
+
+        lastClockSyncDebug =
+          `Clock offset ${Math.round(serverClockOffsetMs)} ms · RTT ${Math.round(bestSample.roundTripMs)} ms`;
+
+        setDebug(lastClockSyncDebug);
+        return true;
+      }
+
+      serverClockOffsetMs = 0;
+      lastClockSyncDebug = "Clock sync unavailable; using device clock.";
+      setDebug(lastClockSyncDebug);
+      return false;
+    }
+
     async function ensureMetadata(timeoutMs = 30000){
       assignSourceIfNeeded();
 
@@ -422,12 +408,59 @@
       });
     }
 
-    async function primeAudioElement(){
-      /*
-        This tries to satisfy mobile browser autoplay restrictions early.
-        It may fail on some phones; that's okay. Manual Begin remains available.
-      */
+    function waitForPlayableAt(targetTimeSec, timeoutMs = SEEK_PLAYABLE_TIMEOUT_MS){
+      return new Promise(resolve=>{
+        const startedAt = highResNowMs();
 
+        function isPlayable(){
+          if(audio.readyState >= 3) return true;
+
+          const bufferedEnd = getBufferedEndFor(targetTimeSec);
+          return bufferedEnd > targetTimeSec + LATE_JOIN_BUFFER_SEC;
+        }
+
+        if(isPlayable()){
+          cleanup();
+          resolve(true);
+          return;
+        }
+
+        const interval = setInterval(()=>{
+          if(isPlayable()){
+            cleanup();
+            resolve(true);
+            return;
+          }
+
+          if(highResNowMs() - startedAt >= timeoutMs){
+            cleanup();
+            resolve(false);
+          }
+        }, 200);
+
+        function onPlayable(){
+          if(isPlayable()){
+            cleanup();
+            resolve(true);
+          }
+        }
+
+        function cleanup(){
+          clearInterval(interval);
+          audio.removeEventListener("canplay", onPlayable);
+          audio.removeEventListener("canplaythrough", onPlayable);
+          audio.removeEventListener("progress", onPlayable);
+          audio.removeEventListener("loadeddata", onPlayable);
+        }
+
+        audio.addEventListener("canplay", onPlayable);
+        audio.addEventListener("canplaythrough", onPlayable);
+        audio.addEventListener("progress", onPlayable);
+        audio.addEventListener("loadeddata", onPlayable);
+      });
+    }
+
+    async function primeAudioElement(){
       try{
         assignSourceIfNeeded();
 
@@ -564,19 +597,56 @@
 
       await ensureMetadata();
 
-      const offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
+      let offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
 
-      if(!hasEnoughToStartAt(offsetSec)){
-        setStatus("Preparing audio…");
-        setDebug(`Waiting for larger mobile buffer at ${formatClockTime(offsetSec)}.`);
+      if(!isFinite(audio.duration) || offsetSec >= audio.duration){
+        setStatus("Start time is beyond the end of the audio");
         return false;
       }
 
       audio.pause();
       resetPlaybackRate();
 
-      audio.currentTime = offsetSec;
-      await waitForSeek();
+      /*
+        Late-join fix:
+        For already-running pieces, seek first. This forces the browser,
+        especially mobile Safari/Chrome, to request audio around the correct
+        timestamp instead of slowly buffering from the beginning.
+      */
+
+      const isLateJoin = offsetSec >= 1;
+
+      if(isLateJoin){
+        setStatus("Joining in progress…");
+        setDebug(`${lastClockSyncDebug} · Seeking to ${formatClockTime(offsetSec)}.`);
+
+        audio.currentTime = offsetSec;
+        await waitForSeek();
+
+        const playable = await waitForPlayableAt(offsetSec);
+
+        if(!playable){
+          setStatus("Still buffering…");
+          setDebug(`${lastClockSyncDebug} · Tap Begin again if needed.`);
+          return false;
+        }
+
+        offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
+
+        if(offsetSec < audio.duration){
+          audio.currentTime = offsetSec;
+          await waitForSeek();
+        }
+      }else{
+        if(!hasEnoughToStartAt(offsetSec)){
+          setStatus("Preparing audio…");
+          setDebug(`Waiting for larger mobile buffer at ${formatClockTime(offsetSec)}.`);
+          return false;
+        }
+
+        audio.currentTime = offsetSec;
+        await waitForSeek();
+      }
 
       audio.muted = false;
       showPlayer();
@@ -712,7 +782,7 @@
           setStatus("Downloading…");
         }else{
           setCountdown("");
-          setStatus("Tap Begin");
+          setStatus("Tap Begin to join");
           waitingForManualStart = true;
           showStartNow();
           setDebug(`${lastClockSyncDebug} · Start time is already in the past; Begin will jump to the correct offset.`);
@@ -755,11 +825,7 @@
 
     audio.addEventListener("loadedmetadata", ()=>{
       updateTransport();
-      if(lastClockSyncDebug){
-        setDebug(lastClockSyncDebug);
-      }else{
-        setDebug("");
-      }
+      setDebug(lastClockSyncDebug || "");
     });
 
     audio.addEventListener("durationchange", updateTransport);
@@ -775,7 +841,9 @@
         const bufferedEnd = getBufferedEndFor(offsetSec);
         const bufferedAhead = Math.max(0, bufferedEnd - offsetSec);
 
-        if(hasEnoughToStartAt(offsetSec)){
+        if(offsetSec >= 1){
+          setDebug(`${lastClockSyncDebug} · Ready to seek/join at ${formatClockTime(offsetSec)}.`);
+        }else if(hasEnoughToStartAt(offsetSec)){
           setStatus("Ready — tap Begin");
           setDebug(`${lastClockSyncDebug} · Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }else{
@@ -788,11 +856,7 @@
       updateTransport();
 
       if(waitingForManualStart && scheduledAnchorMs != null){
-        const offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
-
-        if(hasEnoughToStartAt(offsetSec)){
-          setStatus("Ready — tap Begin");
-        }
+        setStatus("Ready — tap Begin");
       }
     });
 
