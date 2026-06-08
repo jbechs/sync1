@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>common</title>
+  <title>PRIME (Heather Christian)</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -126,8 +126,8 @@
 <body>
   <main class="container">
     <div class="header">
-      <h1>common</h1>
-      <div class="subtitle">v1</div>
+      <h1>PRIME</h1>
+      <div class="subtitle">Heather Christian</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -145,7 +145,7 @@
   </main>
 
   <script>
-    const AUDIO_URL = "https://eggtooth.xyz/coreymixtest1.mp3";
+    const AUDIO_URL = "https://audio.eggtooth.xyz/prime.mp3";
 
     const audio = document.getElementById("audio");
     const playButton = document.getElementById("playButton");
@@ -166,28 +166,44 @@
     let sourceAssigned = false;
     let waitingForManualStart = false;
     let startAttempted = false;
-    let isCorrecting = false;
     let lastDriftSec = 0;
 
-    const START_BUFFER_SEC = 4;
-    const READINESS_CHECK_MS = 200;
-    const DRIFT_CHECK_MS = 250;
-    const TRANSPORT_UPDATE_MS = 250;
+    /*
+      ROUND 2: STABILITY-FIRST SETTINGS
 
-    const SOFT_DRIFT_THRESHOLD_SEC = 0.08;
-    const DRIFT_RECOVER_SEC = 0.035;
-    const HARD_SEEK_THRESHOLD_SEC = 0.45;
+      This version avoids continuous playbackRate changes because mobile browsers
+      can produce audio cutouts when asked to stream, seek, and resample audio.
 
+      Strategy:
+      - Prebuffer more audio before starting.
+      - Let small drift exist.
+      - Only perform a hard seek if drift becomes large.
+      - Update diagnostics less often.
+    */
+
+    const START_BUFFER_SEC = 15;
+    const READINESS_CHECK_MS = 500;
+    const DRIFT_CHECK_MS = 2000;
+    const TRANSPORT_UPDATE_MS = 1000;
+
+    const HARD_SEEK_THRESHOLD_SEC = 0.75;
     const NORMAL_RATE = 1.0;
-    const MAX_RATE_ADJUST = 0.035;
 
     function highResNowMs(){
       return performance.timeOrigin + performance.now();
     }
 
-    function setStatus(msg){ statusEl.textContent = msg; }
-    function setCountdown(msg){ countdownEl.textContent = msg; }
-    function setDebug(msg){ debugEl.textContent = msg || ""; }
+    function setStatus(msg){
+      statusEl.textContent = msg;
+    }
+
+    function setCountdown(msg){
+      countdownEl.textContent = msg;
+    }
+
+    function setDebug(msg){
+      debugEl.textContent = msg || "";
+    }
 
     function showPlayer(){
       audio.classList.remove("hidden");
@@ -199,29 +215,37 @@
       audio.controls = false;
     }
 
-    function showStartNow(){ startNowButton.classList.remove("hidden"); }
-    function hideStartNow(){ startNowButton.classList.add("hidden"); }
+    function showStartNow(){
+      startNowButton.classList.remove("hidden");
+    }
+
+    function hideStartNow(){
+      startNowButton.classList.add("hidden");
+    }
 
     function clearTimers(){
       if(countdownFrame){
         cancelAnimationFrame(countdownFrame);
         countdownFrame = null;
       }
+
       if(countdownTimer){
         clearTimeout(countdownTimer);
         countdownTimer = null;
       }
+
       if(readinessInterval){
         clearInterval(readinessInterval);
         readinessInterval = null;
       }
     }
 
-    function clearDriftMonitor(){
+    function clearPlaybackMonitors(){
       if(driftInterval){
         clearInterval(driftInterval);
         driftInterval = null;
       }
+
       if(transportInterval){
         clearInterval(transportInterval);
         transportInterval = null;
@@ -230,11 +254,11 @@
 
     function resetPlaybackRate(){
       audio.playbackRate = NORMAL_RATE;
-      isCorrecting = false;
     }
 
     function assignSourceIfNeeded(){
       if(sourceAssigned) return;
+
       audio.src = AUDIO_URL;
       audio.preload = "auto";
       sourceAssigned = true;
@@ -256,14 +280,17 @@
       const s = Math.max(0, Math.ceil(ms / 1000));
       const m = Math.floor(s / 60);
       const sec = s % 60;
+
       return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
     }
 
     function formatClockTime(sec){
       sec = Math.max(0, sec || 0);
+
       const whole = Math.floor(sec);
       const m = Math.floor(whole / 60);
       const s = whole % 60;
+
       return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
     }
 
@@ -271,7 +298,9 @@
       const current = audio.currentTime || 0;
       const duration = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
       const driftMs = Math.round(lastDriftSec * 1000);
-      transportEl.textContent = `${formatClockTime(current)} / ${formatClockTime(duration)} · drift ${driftMs} ms`;
+
+      transportEl.textContent =
+        `${formatClockTime(current)} / ${formatClockTime(duration)} · drift ${driftMs} ms`;
     }
 
     async function ensureMetadata(timeoutMs = 30000){
@@ -315,19 +344,29 @@
           resolve();
           return;
         }
+
         audio.addEventListener("seeked", resolve, { once:true });
       });
     }
 
     async function primeAudioElement(){
+      /*
+        This tries to satisfy mobile browser autoplay restrictions early.
+        It may fail on some phones; that's okay. Manual Begin remains available.
+      */
+
       try{
         assignSourceIfNeeded();
+
         audio.muted = true;
         await audio.play();
+
         audio.pause();
         audio.currentTime = 0;
         audio.muted = false;
+
         await waitForSeek();
+
         return true;
       }catch(err){
         audio.muted = false;
@@ -341,6 +380,25 @@
       audio.load();
     }
 
+    function getBufferedEndFor(targetTimeSec){
+      try{
+        if(audio.buffered.length === 0) return 0;
+
+        for(let i = 0; i < audio.buffered.length; i++){
+          const start = audio.buffered.start(i);
+          const end = audio.buffered.end(i);
+
+          if(targetTimeSec >= start && targetTimeSec <= end){
+            return end;
+          }
+        }
+
+        return 0;
+      }catch(err){
+        return 0;
+      }
+    }
+
     function hasBufferedThrough(targetTimeSec){
       try{
         if(audio.buffered.length === 0) return false;
@@ -349,7 +407,7 @@
           const start = audio.buffered.start(i);
           const end = audio.buffered.end(i);
 
-          if(targetTimeSec >= start && targetTimeSec <= end - 0.15){
+          if(targetTimeSec >= start && targetTimeSec <= end - 0.25){
             return true;
           }
         }
@@ -372,59 +430,57 @@
 
     function getExpectedTrackTimeSec(){
       if(scheduledAnchorMs == null) return null;
+
       return Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
     }
 
     function getCurrentDriftSec(){
       const expected = getExpectedTrackTimeSec();
+
       if(expected == null) return 0;
+
       return expected - audio.currentTime;
     }
 
-    function clamp(value, min, max){
-      return Math.min(max, Math.max(min, value));
+    async function hardSyncToExpectedTime(reason){
+      const expected = getExpectedTrackTimeSec();
+
+      if(expected == null) return;
+      if(!isFinite(audio.duration) || expected >= audio.duration) return;
+
+      const bufferedEnd = getBufferedEndFor(expected);
+
+      if(bufferedEnd > expected + 1){
+        audio.currentTime = expected;
+        await waitForSeek();
+
+        lastDriftSec = getCurrentDriftSec();
+        setStatus(reason);
+        updateTransport();
+      }else{
+        setStatus("Sync delayed — buffering");
+        setDebug(`Need audio near ${formatClockTime(expected)} before correcting.`);
+      }
     }
 
-    function updateCorrectionStatus(){
+    function checkDriftStabilityFirst(){
       if(audio.paused || audio.ended || scheduledAnchorMs == null) return;
 
       const driftSec = getCurrentDriftSec();
       lastDriftSec = driftSec;
-      const abs = Math.abs(driftSec);
 
-      if(abs >= HARD_SEEK_THRESHOLD_SEC){
-        const expected = getExpectedTrackTimeSec();
-        if(expected != null && expected < audio.duration){
-          audio.currentTime = expected;
-          resetPlaybackRate();
-          setStatus(`Hard sync correction (${Math.round(driftSec * 1000)} ms)`);
-        }
+      if(Math.abs(driftSec) >= HARD_SEEK_THRESHOLD_SEC){
+        hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
+      }else{
+        setStatus("Playing");
         updateTransport();
-        return;
       }
-
-      if(abs <= DRIFT_RECOVER_SEC){
-        if(isCorrecting){
-          resetPlaybackRate();
-          setStatus("Playing");
-        }
-        updateTransport();
-        return;
-      }
-
-      if(abs >= SOFT_DRIFT_THRESHOLD_SEC){
-        const adjust = clamp(driftSec * 0.08, -MAX_RATE_ADJUST, MAX_RATE_ADJUST);
-        audio.playbackRate = NORMAL_RATE + adjust;
-        isCorrecting = true;
-        setStatus(`Sync correction (${Math.round(driftSec * 1000)} ms)`);
-      }
-
-      updateTransport();
     }
 
-    function beginDriftMonitor(){
-      clearDriftMonitor();
-      driftInterval = setInterval(updateCorrectionStatus, DRIFT_CHECK_MS);
+    function beginPlaybackMonitors(){
+      clearPlaybackMonitors();
+
+      driftInterval = setInterval(checkDriftStabilityFirst, DRIFT_CHECK_MS);
       transportInterval = setInterval(updateTransport, TRANSPORT_UPDATE_MS);
     }
 
@@ -439,7 +495,7 @@
 
       if(!hasEnoughToStartAt(offsetSec)){
         setStatus("Preparing audio…");
-        setDebug(`Waiting for enough audio at ${formatClockTime(offsetSec)}.`);
+        setDebug(`Waiting for larger mobile buffer at ${formatClockTime(offsetSec)}.`);
         return false;
       }
 
@@ -451,27 +507,34 @@
 
       audio.muted = false;
       showPlayer();
+
       await audio.play();
 
       lockBeginButton();
       waitingForManualStart = false;
       startAttempted = true;
+
       hideStartNow();
       setCountdown("");
       setStatus("Playing");
       setDebug("");
+
       lastDriftSec = getCurrentDriftSec();
+
       updateTransport();
-      beginDriftMonitor();
+      beginPlaybackMonitors();
+
       return true;
     }
 
     async function tryAutomaticStart(){
       if(startAttempted) return;
+
       startAttempted = true;
 
       try{
         const started = await startPlaybackAtCurrentCorrectOffset();
+
         if(!started){
           startAttempted = false;
           waitingForManualStart = true;
@@ -493,10 +556,13 @@
 
       readinessInterval = setInterval(()=>{
         const offsetSec = Math.max(0, (highResNowMs() - startTimeMs) / 1000);
+        const bufferedEnd = getBufferedEndFor(offsetSec);
+        const bufferedAhead = Math.max(0, bufferedEnd - offsetSec);
+
         if(hasEnoughToStartAt(offsetSec)){
-          setDebug("Audio ready for scheduled start.");
+          setDebug(`Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }else{
-          setDebug("Preloading audio for scheduled start…");
+          setDebug(`Preloading audio. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }
       }, READINESS_CHECK_MS);
 
@@ -512,6 +578,7 @@
 
         setCountdown(`Starting in ${formatCountdown(remaining)}`);
         setStatus("Downloading…");
+
         countdownFrame = requestAnimationFrame(updateCountdown);
       }
 
@@ -526,12 +593,14 @@
 
     async function handlePrepare(){
       clearTimers();
-      clearDriftMonitor();
+      clearPlaybackMonitors();
       resetPlaybackRate();
+
       hideStartNow();
       waitingForManualStart = false;
       startAttempted = false;
       lastDriftSec = 0;
+
       setDebug("");
 
       if(!startInput.value){
@@ -591,6 +660,7 @@
 
       try{
         const started = await startPlaybackAtCurrentCorrectOffset();
+
         if(!started){
           showStartNow();
         }
@@ -621,8 +691,14 @@
 
       if(waitingForManualStart && scheduledAnchorMs != null){
         const offsetSec = Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
+        const bufferedEnd = getBufferedEndFor(offsetSec);
+        const bufferedAhead = Math.max(0, bufferedEnd - offsetSec);
+
         if(hasEnoughToStartAt(offsetSec)){
           setStatus("Ready — tap Begin");
+          setDebug(`Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
+        }else{
+          setDebug(`Buffering. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }
       }
     });
@@ -632,6 +708,7 @@
 
       if(waitingForManualStart && scheduledAnchorMs != null){
         const offsetSec = Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
+
         if(hasEnoughToStartAt(offsetSec)){
           setStatus("Ready — tap Begin");
         }
@@ -644,13 +721,16 @@
       }
     });
 
+    audio.addEventListener("stalled", ()=>{
+      if(!audio.ended && !audio.paused){
+        setStatus("Network/audio stalled");
+        setDebug("Phone may need more buffered audio before stable playback.");
+      }
+    });
+
     audio.addEventListener("playing", ()=>{
       lockBeginButton();
-
-      if(!isCorrecting){
-        setStatus("Playing");
-      }
-
+      setStatus("Playing");
       updateTransport();
     });
 
@@ -658,13 +738,16 @@
 
     audio.addEventListener("ended", ()=>{
       clearTimers();
-      clearDriftMonitor();
+      clearPlaybackMonitors();
       resetPlaybackRate();
+
       waitingForManualStart = false;
       startAttempted = false;
+
       setCountdown("");
       setStatus("Playback ended");
       setDebug("");
+
       showPlayer();
       updateTransport();
     });
