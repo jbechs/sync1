@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PRIME (Heather Christian)</title>
+  <title>common</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -126,26 +126,26 @@
 <body>
   <main class="container">
     <div class="header">
-      <h1>PRIME</h1>
-      <div class="subtitle">Heather Christian</div>
+      <h1>common</h1>
+      <div class="subtitle">v1</div>
     </div>
 
     <label for="startTime">Start Time</label>
-    <input id="startTime" type="datetime-local" step="1" />
+    <input id="startTime" type="datetime-local" step="60" />
 
     <button id="playButton">Begin</button>
     <button id="startNowButton" class="startNow hidden">Begin</button>
 
     <div id="countdown" class="countdown"></div>
     <div id="status" class="status">Ready.</div>
-    <div id="transport" class="transport">00:00 / 00:00</div>
+    <div id="transport" class="transport">00:00 / 00:00 · drift 0 ms</div>
     <div id="debug" class="debug"></div>
 
     <audio id="audio" preload="auto" playsinline class="hidden"></audio>
   </main>
 
   <script>
-    const AUDIO_URL = "https://audio.eggtooth.xyz/prime.mp3";
+    const AUDIO_URL = "https://eggtooth.xyz/coreymixtest1.mp3";
 
     const audio = document.getElementById("audio");
     const playButton = document.getElementById("playButton");
@@ -253,12 +253,10 @@
     }
 
     function formatCountdown(ms){
-      const totalTenths = Math.max(0, Math.ceil(ms / 100));
-      const totalSeconds = Math.floor(totalTenths / 10);
-      const tenths = totalTenths % 10;
-      const m = Math.floor(totalSeconds / 60);
-      const sec = totalSeconds % 60;
-      return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}.${tenths}`;
+      const s = Math.max(0, Math.ceil(ms / 1000));
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
     }
 
     function formatClockTime(sec){
