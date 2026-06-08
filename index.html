@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1</div>
+      <div class="subtitle">v1 · cloud sync</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -146,6 +146,7 @@
 
   <script>
     const AUDIO_URL = "https://eggtooth.xyz/coreymixtest1.mp3";
+    const TIME_SERVER_URL = "https://sync1.jbechs.workers.dev/";
 
     const audio = document.getElementById("audio");
     const playButton = document.getElementById("playButton");
@@ -167,18 +168,19 @@
     let waitingForManualStart = false;
     let startAttempted = false;
     let lastDriftSec = 0;
+    let serverClockOffsetMs = 0;
+    let lastClockSyncDebug = "";
 
     /*
-      ROUND 2: STABILITY-FIRST SETTINGS
-
-      This version avoids continuous playbackRate changes because mobile browsers
-      can produce audio cutouts when asked to stream, seek, and resample audio.
+      ROUND 3: CLOUDFLARE CLOCK SYNC + STABILITY-FIRST AUDIO
 
       Strategy:
-      - Prebuffer more audio before starting.
-      - Let small drift exist.
-      - Only perform a hard seek if drift becomes large.
-      - Update diagnostics less often.
+      - Ask a Cloudflare Worker for server time.
+      - Estimate network round-trip time.
+      - Calculate this device's offset from Cloudflare time.
+      - Use syncedNowMs() for scheduling and drift calculations.
+      - Keep the stability-first audio strategy from Round 2:
+        no continuous playbackRate changes, only hard seeks if drift is large.
     */
 
     const START_BUFFER_SEC = 15;
@@ -191,6 +193,77 @@
 
     function highResNowMs(){
       return performance.timeOrigin + performance.now();
+    }
+
+    function syncedNowMs(){
+      return highResNowMs() + serverClockOffsetMs;
+    }
+
+    async function syncServerClock(samples = 5){
+      /*
+        We take several samples and keep the one with the lowest round-trip time.
+        That is usually the cleanest estimate of server time.
+      */
+
+      let bestSample = null;
+
+      for(let i = 0; i < samples; i++){
+        try{
+          const t0 = highResNowMs();
+
+          const response = await fetch(TIME_SERVER_URL, {
+            cache: "no-store"
+          });
+
+          if(!response.ok){
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const data = await response.json();
+          const t1 = highResNowMs();
+
+          if(typeof data.now !== "number"){
+            throw new Error("Bad time response");
+          }
+
+          const roundTripMs = t1 - t0;
+          const estimatedServerNow = data.now + (roundTripMs / 2);
+          const offsetMs = estimatedServerNow - t1;
+
+          const sample = {
+            offsetMs,
+            roundTripMs
+          };
+
+          if(!bestSample || sample.roundTripMs < bestSample.roundTripMs){
+            bestSample = sample;
+          }
+        }catch(err){
+          if(i === samples - 1 && !bestSample){
+            serverClockOffsetMs = 0;
+            lastClockSyncDebug = `Clock sync failed: ${err.message}`;
+            setDebug(lastClockSyncDebug);
+            return false;
+          }
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 80));
+      }
+
+      if(bestSample){
+        serverClockOffsetMs = bestSample.offsetMs;
+
+        lastClockSyncDebug =
+          `Clock offset ${Math.round(serverClockOffsetMs)} ms · RTT ${Math.round(bestSample.roundTripMs)} ms`;
+
+        setDebug(lastClockSyncDebug);
+        return true;
+      }
+
+      serverClockOffsetMs = 0;
+      lastClockSyncDebug = "Clock sync unavailable; using device clock.";
+      setDebug(lastClockSyncDebug);
+      return false;
     }
 
     function setStatus(msg){
@@ -431,7 +504,7 @@
     function getExpectedTrackTimeSec(){
       if(scheduledAnchorMs == null) return null;
 
-      return Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
+      return Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
     }
 
     function getCurrentDriftSec(){
@@ -491,7 +564,7 @@
 
       await ensureMetadata();
 
-      const offsetSec = Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
+      const offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
 
       if(!hasEnoughToStartAt(offsetSec)){
         setStatus("Preparing audio…");
@@ -517,7 +590,7 @@
       hideStartNow();
       setCountdown("");
       setStatus("Playing");
-      setDebug("");
+      setDebug(lastClockSyncDebug || "");
 
       lastDriftSec = getCurrentDriftSec();
 
@@ -555,19 +628,19 @@
       startAttempted = false;
 
       readinessInterval = setInterval(()=>{
-        const offsetSec = Math.max(0, (highResNowMs() - startTimeMs) / 1000);
+        const offsetSec = Math.max(0, (syncedNowMs() - startTimeMs) / 1000);
         const bufferedEnd = getBufferedEndFor(offsetSec);
         const bufferedAhead = Math.max(0, bufferedEnd - offsetSec);
 
         if(hasEnoughToStartAt(offsetSec)){
-          setDebug(`Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
+          setDebug(`${lastClockSyncDebug} · Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }else{
-          setDebug(`Preloading audio. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
+          setDebug(`${lastClockSyncDebug} · Preloading audio. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }
       }, READINESS_CHECK_MS);
 
       function updateCountdown(){
-        const remaining = startTimeMs - highResNowMs();
+        const remaining = startTimeMs - syncedNowMs();
 
         if(remaining <= 0){
           clearTimers();
@@ -588,7 +661,7 @@
         clearTimers();
         setCountdown("Starting now");
         tryAutomaticStart();
-      }, Math.max(0, startTimeMs - highResNowMs()));
+      }, Math.max(0, startTimeMs - syncedNowMs()));
     }
 
     async function handlePrepare(){
@@ -618,6 +691,10 @@
       try{
         hidePlayer();
         startDownload();
+        setStatus("Syncing clock…");
+
+        await syncServerClock();
+
         setStatus("Downloading…");
 
         await ensureMetadata();
@@ -626,7 +703,7 @@
         await primeAudioElement();
 
         const startTimeMs = new Date(startInput.value).getTime();
-        const offsetSec = (highResNowMs() - startTimeMs) / 1000;
+        const offsetSec = (syncedNowMs() - startTimeMs) / 1000;
 
         scheduledAnchorMs = startTimeMs;
 
@@ -638,7 +715,7 @@
           setStatus("Tap Begin");
           waitingForManualStart = true;
           showStartNow();
-          setDebug("Start time is already in the past; Begin will jump to the correct offset.");
+          setDebug(`${lastClockSyncDebug} · Start time is already in the past; Begin will jump to the correct offset.`);
         }
       }catch(err){
         setStatus("Audio source did not load");
@@ -678,7 +755,11 @@
 
     audio.addEventListener("loadedmetadata", ()=>{
       updateTransport();
-      setDebug("");
+      if(lastClockSyncDebug){
+        setDebug(lastClockSyncDebug);
+      }else{
+        setDebug("");
+      }
     });
 
     audio.addEventListener("durationchange", updateTransport);
@@ -690,15 +771,15 @@
       updateTransport();
 
       if(waitingForManualStart && scheduledAnchorMs != null){
-        const offsetSec = Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
+        const offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
         const bufferedEnd = getBufferedEndFor(offsetSec);
         const bufferedAhead = Math.max(0, bufferedEnd - offsetSec);
 
         if(hasEnoughToStartAt(offsetSec)){
           setStatus("Ready — tap Begin");
-          setDebug(`Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
+          setDebug(`${lastClockSyncDebug} · Audio ready. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }else{
-          setDebug(`Buffering. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
+          setDebug(`${lastClockSyncDebug} · Buffering. Buffer ahead: ${bufferedAhead.toFixed(1)}s.`);
         }
       }
     });
@@ -707,7 +788,7 @@
       updateTransport();
 
       if(waitingForManualStart && scheduledAnchorMs != null){
-        const offsetSec = Math.max(0, (highResNowMs() - scheduledAnchorMs) / 1000);
+        const offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
 
         if(hasEnoughToStartAt(offsetSec)){
           setStatus("Ready — tap Begin");
@@ -746,7 +827,7 @@
 
       setCountdown("");
       setStatus("Playback ended");
-      setDebug("");
+      setDebug(lastClockSyncDebug || "");
 
       showPlayer();
       updateTransport();
