@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1.3</div>
+      <div class="subtitle">v1.4</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -182,10 +182,17 @@
     const SEEK_PLAYABLE_TIMEOUT_MS = 12000;
 
     const READINESS_CHECK_MS = 500;
-    const DRIFT_CHECK_MS = 1000;
-    const TRANSPORT_UPDATE_MS = 1000;
+    const DRIFT_CHECK_MS = 250;
+    const TRANSPORT_UPDATE_MS = 500;
 
-    const HARD_SEEK_THRESHOLD_SEC = 0.50;
+    // Tighter sync test:
+    // - below SOFT_CORRECTION_THRESHOLD_SEC: leave playback alone
+    // - between soft and hard thresholds: gently speed up/slow down playback
+    // - above HARD_SEEK_THRESHOLD_SEC: seek directly to expected time
+    const SOFT_CORRECTION_THRESHOLD_SEC = 0.05;
+    const HARD_SEEK_THRESHOLD_SEC = 0.25;
+    const MAX_RATE_ADJUST = 0.03;
+    const RATE_CORRECTION_GAIN = 0.12;
     const NORMAL_RATE = 1.0;
 
     const PRESHOW_VOLUME = 1.0;
@@ -703,6 +710,7 @@
       if(bufferedEnd > expected + 1){
         audio.currentTime = expected;
         await waitForSeek();
+        resetPlaybackRate();
 
         lastDriftSec = getCurrentDriftSec();
         setStatus(reason);
@@ -711,6 +719,30 @@
         setStatus("Sync delayed — buffering");
         setDebug(`Need audio near ${formatClockTime(expected)} before correcting.`);
       }
+    }
+
+    function clamp(value, min, max){
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function applyGentleRateCorrection(driftSec){
+      const absDrift = Math.abs(driftSec);
+
+      if(absDrift < SOFT_CORRECTION_THRESHOLD_SEC){
+        resetPlaybackRate();
+        setStatus("Playing");
+        return;
+      }
+
+      const adjustment = clamp(
+        driftSec * RATE_CORRECTION_GAIN,
+        -MAX_RATE_ADJUST,
+        MAX_RATE_ADJUST
+      );
+
+      audio.playbackRate = NORMAL_RATE + adjustment;
+
+      setStatus(`Fine sync (${Math.round(driftSec * 1000)} ms)`);
     }
 
     function checkDriftStabilityFirst(){
@@ -722,7 +754,7 @@
       if(Math.abs(driftSec) >= HARD_SEEK_THRESHOLD_SEC){
         hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
       }else{
-        setStatus("Playing");
+        applyGentleRateCorrection(driftSec);
         updateTransport();
       }
     }
