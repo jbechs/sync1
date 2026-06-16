@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1.5</div>
+      <div class="subtitle">v1.5.1 · stable correction</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -176,6 +176,9 @@
     let lastDriftSec = 0;
     let serverClockOffsetMs = 0;
     let lastClockSyncDebug = "";
+    let consecutiveHardSeekChecks = 0;
+    let lastHardSeekAtMs = 0;
+    let hardSeekInProgress = false;
 
     const START_BUFFER_SEC = 15;
     const LATE_JOIN_BUFFER_SEC = 1.0;
@@ -185,12 +188,14 @@
     const DRIFT_CHECK_MS = 500;
     const TRANSPORT_UPDATE_MS = 500;
 
-    // Stable tighter sync test:
-    // This version removes continuous playbackRate nudging because some browsers
-    // produce audible stutters when rate changes repeatedly during MP3 playback.
-    // It keeps faster drift monitoring and uses a more assertive hard correction
-    // than v1.3, but avoids constant micro-adjustments.
-    const HARD_SEEK_THRESHOLD_SEC = 0.35;
+    // v1.5.1 stable correction:
+    // This version keeps the successful pre-show/crossfade system and the
+    // stable no-playbackRate correction model, but makes hard seek correction
+    // less reactive. A hard correction now requires persistent drift above the
+    // threshold and then gives the browser a short cooldown to stabilize.
+    const HARD_SEEK_THRESHOLD_SEC = 0.60;
+    const HARD_SEEK_CONFIRMATION_CHECKS = 2;
+    const POST_SEEK_COOLDOWN_MS = 3000;
     const NORMAL_RATE = 1.0;
 
     const PRESHOW_VOLUME = 1.0;
@@ -263,6 +268,9 @@
         clearInterval(transportInterval);
         transportInterval = null;
       }
+
+      consecutiveHardSeekChecks = 0;
+      hardSeekInProgress = false;
     }
 
     function clearCrossfade(){
@@ -698,36 +706,67 @@
     }
 
     async function hardSyncToExpectedTime(reason){
+      if(hardSeekInProgress) return false;
+
       const expected = getExpectedTrackTimeSec();
 
-      if(expected == null) return;
-      if(!isFinite(audio.duration) || expected >= audio.duration) return;
+      if(expected == null) return false;
+      if(!isFinite(audio.duration) || expected >= audio.duration) return false;
 
       const bufferedEnd = getBufferedEndFor(expected);
 
       if(bufferedEnd > expected + 1){
-        audio.currentTime = expected;
-        await waitForSeek();
-        resetPlaybackRate();
+        hardSeekInProgress = true;
 
-        lastDriftSec = getCurrentDriftSec();
-        setStatus(reason);
-        updateTransport();
+        try{
+          audio.currentTime = expected;
+          await waitForSeek();
+          resetPlaybackRate();
+
+          lastDriftSec = getCurrentDriftSec();
+          lastHardSeekAtMs = highResNowMs();
+          consecutiveHardSeekChecks = 0;
+
+          setStatus(reason);
+          setDebug(`${lastClockSyncDebug} · Stabilizing after correction.`);
+          updateTransport();
+
+          return true;
+        }finally{
+          hardSeekInProgress = false;
+        }
       }else{
         setStatus("Sync delayed — buffering");
         setDebug(`Need audio near ${formatClockTime(expected)} before correcting.`);
+        return false;
       }
     }
 
     function checkDriftStabilityFirst(){
       if(audio.paused || audio.ended || scheduledAnchorMs == null) return;
 
+      const now = highResNowMs();
       const driftSec = getCurrentDriftSec();
       lastDriftSec = driftSec;
 
+      if(now - lastHardSeekAtMs < POST_SEEK_COOLDOWN_MS){
+        resetPlaybackRate();
+        setStatus("Stabilizing…");
+        updateTransport();
+        return;
+      }
+
       if(Math.abs(driftSec) >= HARD_SEEK_THRESHOLD_SEC){
-        hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
+        consecutiveHardSeekChecks += 1;
+
+        if(consecutiveHardSeekChecks >= HARD_SEEK_CONFIRMATION_CHECKS){
+          hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
+        }else{
+          setStatus(`Checking sync (${Math.round(driftSec * 1000)} ms)`);
+          updateTransport();
+        }
       }else{
+        consecutiveHardSeekChecks = 0;
         resetPlaybackRate();
         setStatus("Playing");
         updateTransport();
@@ -899,6 +938,9 @@
       waitingForManualStart = false;
       startAttempted = false;
       lastDriftSec = 0;
+      consecutiveHardSeekChecks = 0;
+      lastHardSeekAtMs = 0;
+      hardSeekInProgress = false;
       audio.volume = MAIN_VOLUME;
 
       setDebug("");
