@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1.2</div>
+      <div class="subtitle">v1.3 · pre-show loop</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -142,13 +142,16 @@
     <div id="debug" class="debug"></div>
 
     <audio id="audio" preload="auto" playsinline class="hidden"></audio>
+    <audio id="preshowAudio" preload="auto" playsinline loop class="hidden"></audio>
   </main>
 
   <script>
     const AUDIO_URL = "https://eggtooth.xyz/commonsite1.mp3";
+    const PRESHOW_AUDIO_URL = "https://eggtooth.xyz/preshowcommon%20Mixdown%201.mp3";
     const TIME_SERVER_URL = "https://sync1.jbechs.workers.dev/";
 
     const audio = document.getElementById("audio");
+    const preshowAudio = document.getElementById("preshowAudio");
     const playButton = document.getElementById("playButton");
     const startNowButton = document.getElementById("startNowButton");
     const startInput = document.getElementById("startTime");
@@ -162,9 +165,12 @@
     let readinessInterval = null;
     let driftInterval = null;
     let transportInterval = null;
+    let crossfadeInterval = null;
 
     let scheduledAnchorMs = null;
     let sourceAssigned = false;
+    let preshowSourceAssigned = false;
+    let preshowPlaying = false;
     let waitingForManualStart = false;
     let startAttempted = false;
     let lastDriftSec = 0;
@@ -181,6 +187,11 @@
 
     const HARD_SEEK_THRESHOLD_SEC = 0.50;
     const NORMAL_RATE = 1.0;
+
+    const PRESHOW_VOLUME = 1.0;
+    const MAIN_VOLUME = 1.0;
+    const CROSSFADE_MS = 1000;
+    const FADE_STEP_MS = 50;
 
     function highResNowMs(){
       return performance.timeOrigin + performance.now();
@@ -249,6 +260,13 @@
       }
     }
 
+    function clearCrossfade(){
+      if(crossfadeInterval){
+        clearInterval(crossfadeInterval);
+        crossfadeInterval = null;
+      }
+    }
+
     function resetPlaybackRate(){
       audio.playbackRate = NORMAL_RATE;
     }
@@ -259,6 +277,15 @@
       audio.src = AUDIO_URL;
       audio.preload = "auto";
       sourceAssigned = true;
+    }
+
+    function assignPreshowSourceIfNeeded(){
+      if(preshowSourceAssigned) return;
+
+      preshowAudio.src = PRESHOW_AUDIO_URL;
+      preshowAudio.preload = "auto";
+      preshowAudio.loop = true;
+      preshowSourceAssigned = true;
     }
 
     function lockBeginButton(){
@@ -397,6 +424,41 @@
       });
     }
 
+    async function ensurePreshowMetadata(timeoutMs = 15000){
+      assignPreshowSourceIfNeeded();
+
+      if(preshowAudio.readyState >= 1){
+        return true;
+      }
+
+      return new Promise(resolve=>{
+        const timeout = setTimeout(()=>{
+          cleanup();
+          resolve(false);
+        }, timeoutMs);
+
+        function onLoaded(){
+          cleanup();
+          resolve(true);
+        }
+
+        function onError(){
+          cleanup();
+          resolve(false);
+        }
+
+        function cleanup(){
+          clearTimeout(timeout);
+          preshowAudio.removeEventListener("loadedmetadata", onLoaded);
+          preshowAudio.removeEventListener("error", onError);
+        }
+
+        preshowAudio.addEventListener("loadedmetadata", onLoaded);
+        preshowAudio.addEventListener("error", onError);
+        preshowAudio.load();
+      });
+    }
+
     function waitForSeek(){
       return new Promise(resolve=>{
         if(!audio.seeking){
@@ -493,6 +555,79 @@
       assignSourceIfNeeded();
       audio.preload = "auto";
       audio.load();
+
+      assignPreshowSourceIfNeeded();
+      preshowAudio.preload = "auto";
+      preshowAudio.load();
+    }
+
+    async function startPreshowLoop(){
+      assignPreshowSourceIfNeeded();
+
+      try{
+        await ensurePreshowMetadata();
+
+        clearCrossfade();
+
+        preshowAudio.loop = true;
+        preshowAudio.muted = false;
+        preshowAudio.volume = PRESHOW_VOLUME;
+
+        if(preshowAudio.paused){
+          await preshowAudio.play();
+        }
+
+        preshowPlaying = true;
+        return true;
+      }catch(err){
+        preshowPlaying = false;
+        setDebug(`${lastClockSyncDebug} · Pre-show audio blocked or unavailable: ${err.message}`);
+        return false;
+      }
+    }
+
+    function stopPreshowImmediately(){
+      clearCrossfade();
+
+      preshowAudio.pause();
+
+      try{
+        preshowAudio.currentTime = 0;
+      }catch(err){
+        // Ignore seek errors on partially loaded mobile audio.
+      }
+
+      preshowAudio.volume = PRESHOW_VOLUME;
+      preshowPlaying = false;
+    }
+
+    function crossfadeFromPreshowToMain(){
+      clearCrossfade();
+
+      const startedAt = highResNowMs();
+
+      audio.volume = 0;
+      audio.muted = false;
+
+      if(!preshowPlaying || preshowAudio.paused){
+        audio.volume = MAIN_VOLUME;
+        return;
+      }
+
+      crossfadeInterval = setInterval(()=>{
+        const elapsed = highResNowMs() - startedAt;
+        const progress = Math.min(1, elapsed / CROSSFADE_MS);
+
+        audio.volume = MAIN_VOLUME * progress;
+        preshowAudio.volume = PRESHOW_VOLUME * (1 - progress);
+
+        if(progress >= 1){
+          clearCrossfade();
+
+          audio.volume = MAIN_VOLUME;
+          stopPreshowImmediately();
+        }
+      }, FADE_STEP_MS);
     }
 
     function getBufferedEndFor(targetTimeSec){
@@ -609,6 +744,7 @@
       let offsetSec = Math.max(0, (syncedNowMs() - scheduledAnchorMs) / 1000);
 
       if(!isFinite(audio.duration) || offsetSec >= audio.duration){
+        stopPreshowImmediately();
         setStatus("Start time is beyond the end of the audio");
         return false;
       }
@@ -650,10 +786,19 @@
         await waitForSeek();
       }
 
-      audio.muted = false;
       showPlayer();
 
+      if(preshowPlaying && !preshowAudio.paused){
+        audio.volume = 0;
+      }else{
+        audio.volume = MAIN_VOLUME;
+      }
+
+      audio.muted = false;
+
       await audio.play();
+
+      crossfadeFromPreshowToMain();
 
       lockBeginButton();
       waitingForManualStart = false;
@@ -722,7 +867,7 @@
         }
 
         setCountdown(`Starting in ${formatCountdown(remaining)}`);
-        setStatus("Downloading…");
+        setStatus(preshowPlaying ? "Pre-show playing…" : "Downloading…");
 
         countdownFrame = requestAnimationFrame(updateCountdown);
       }
@@ -739,12 +884,15 @@
     async function handlePrepare(){
       clearTimers();
       clearPlaybackMonitors();
+      clearCrossfade();
       resetPlaybackRate();
 
+      stopPreshowImmediately();
       hideStartNow();
       waitingForManualStart = false;
       startAttempted = false;
       lastDriftSec = 0;
+      audio.volume = MAIN_VOLUME;
 
       setDebug("");
 
@@ -780,9 +928,11 @@
         scheduledAnchorMs = startTimeMs;
 
         if(offsetSec < 0){
+          await startPreshowLoop();
           beginCountdown(startTimeMs);
-          setStatus("Downloading…");
+          setStatus(preshowPlaying ? "Pre-show playing…" : "Downloading…");
         }else{
+          stopPreshowImmediately();
           setCountdown("");
           setStatus("Tap Begin to join");
           waitingForManualStart = true;
@@ -790,6 +940,7 @@
           setDebug(`${lastClockSyncDebug} · Start time is already in the past; Begin will jump to the correct offset.`);
         }
       }catch(err){
+        stopPreshowImmediately();
         setStatus("Audio source did not load");
         setDebug(`Load failed: ${err.message}`);
       }finally{
@@ -886,7 +1037,9 @@
     audio.addEventListener("ended", ()=>{
       clearTimers();
       clearPlaybackMonitors();
+      clearCrossfade();
       resetPlaybackRate();
+      stopPreshowImmediately();
 
       waitingForManualStart = false;
       startAttempted = false;
@@ -900,9 +1053,15 @@
     });
 
     audio.addEventListener("error", ()=>{
+      stopPreshowImmediately();
       setStatus("Audio failed to load");
       setDebug("Check custom domain, public bucket, CORS, and direct MP3 URL.");
       unlockBeginButton();
+    });
+
+    preshowAudio.addEventListener("error", ()=>{
+      preshowPlaying = false;
+      setDebug(`${lastClockSyncDebug} · Pre-show audio failed to load.`);
     });
 
     updateTransport();
