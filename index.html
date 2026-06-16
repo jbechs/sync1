@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1.4</div>
+      <div class="subtitle">v1.4b · stable tighter sync</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -182,17 +182,15 @@
     const SEEK_PLAYABLE_TIMEOUT_MS = 12000;
 
     const READINESS_CHECK_MS = 500;
-    const DRIFT_CHECK_MS = 250;
+    const DRIFT_CHECK_MS = 500;
     const TRANSPORT_UPDATE_MS = 500;
 
-    // Tighter sync test:
-    // - below SOFT_CORRECTION_THRESHOLD_SEC: leave playback alone
-    // - between soft and hard thresholds: gently speed up/slow down playback
-    // - above HARD_SEEK_THRESHOLD_SEC: seek directly to expected time
-    const SOFT_CORRECTION_THRESHOLD_SEC = 0.05;
-    const HARD_SEEK_THRESHOLD_SEC = 0.25;
-    const MAX_RATE_ADJUST = 0.03;
-    const RATE_CORRECTION_GAIN = 0.12;
+    // Stable tighter sync test:
+    // This version removes continuous playbackRate nudging because some browsers
+    // produce audible stutters when rate changes repeatedly during MP3 playback.
+    // It keeps faster drift monitoring and uses a more assertive hard correction
+    // than v1.3, but avoids constant micro-adjustments.
+    const HARD_SEEK_THRESHOLD_SEC = 0.35;
     const NORMAL_RATE = 1.0;
 
     const PRESHOW_VOLUME = 1.0;
@@ -721,30 +719,6 @@
       }
     }
 
-    function clamp(value, min, max){
-      return Math.min(max, Math.max(min, value));
-    }
-
-    function applyGentleRateCorrection(driftSec){
-      const absDrift = Math.abs(driftSec);
-
-      if(absDrift < SOFT_CORRECTION_THRESHOLD_SEC){
-        resetPlaybackRate();
-        setStatus("Playing");
-        return;
-      }
-
-      const adjustment = clamp(
-        driftSec * RATE_CORRECTION_GAIN,
-        -MAX_RATE_ADJUST,
-        MAX_RATE_ADJUST
-      );
-
-      audio.playbackRate = NORMAL_RATE + adjustment;
-
-      setStatus(`Fine sync (${Math.round(driftSec * 1000)} ms)`);
-    }
-
     function checkDriftStabilityFirst(){
       if(audio.paused || audio.ended || scheduledAnchorMs == null) return;
 
@@ -754,7 +728,8 @@
       if(Math.abs(driftSec) >= HARD_SEEK_THRESHOLD_SEC){
         hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
       }else{
-        applyGentleRateCorrection(driftSec);
+        resetPlaybackRate();
+        setStatus("Playing");
         updateTransport();
       }
     }
