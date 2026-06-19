@@ -127,7 +127,7 @@
   <main class="container">
     <div class="header">
       <h1>common</h1>
-      <div class="subtitle">v1.5.2 · dev sync test</div>
+      <div class="subtitle">v1.5.3 · dev sync test</div>
     </div>
 
     <label for="startTime">Start Time</label>
@@ -174,8 +174,6 @@
     let waitingForManualStart = false;
     let startAttempted = false;
     let lastDriftSec = 0;
-    let driftSamples = [];
-    let sustainedHardDriftCount = 0;
     let serverClockOffsetMs = 0;
     let lastClockSyncDebug = "";
     let syncSuppressedUntilMs = 0;
@@ -184,22 +182,19 @@
     const START_BUFFER_SEC = 15;
     const LATE_JOIN_BUFFER_SEC = 1.0;
     const SEEK_PLAYABLE_TIMEOUT_MS = 12000;
+    const LATE_JOIN_SETTLE_MS = 6000;
+    const HARD_SEEK_SETTLE_MS = 6000;
 
     const READINESS_CHECK_MS = 500;
     const DRIFT_CHECK_MS = 250;
     const TRANSPORT_UPDATE_MS = 500;
 
-    // v1.5.2 drift stabilization:
-    // - use a rolling average instead of one noisy drift reading
-    // - require sustained large drift before a hard seek
-    // - give mobile browsers a longer post-seek settling window
+    // Tighter sync test:
+    // - below SOFT_CORRECTION_THRESHOLD_SEC: leave playback alone
+    // - between soft and hard thresholds: gently speed up/slow down playback
+    // - above HARD_SEEK_THRESHOLD_SEC: seek directly to expected time
     const SOFT_CORRECTION_THRESHOLD_SEC = 0.05;
     const HARD_SEEK_THRESHOLD_SEC = 0.75;
-    const HARD_SEEK_CONFIRMATION_SAMPLES = 3;
-    const DRIFT_SAMPLE_WINDOW = 5;
-    const POST_HARD_SEEK_SUPPRESSION_MS = 5000;
-    const STARTUP_SYNC_SUPPRESSION_MS = 1500;
-    const LATE_JOIN_SYNC_SUPPRESSION_MS = 3000;
     const MAX_RATE_ADJUST = 0.03;
     const RATE_CORRECTION_GAIN = 0.12;
     const NORMAL_RATE = 1.0;
@@ -716,22 +711,6 @@
       return expected - audio.currentTime;
     }
 
-    function resetDriftHistory(){
-      driftSamples = [];
-      sustainedHardDriftCount = 0;
-    }
-
-    function getSmoothedDriftSec(newSampleSec){
-      driftSamples.push(newSampleSec);
-
-      if(driftSamples.length > DRIFT_SAMPLE_WINDOW){
-        driftSamples.shift();
-      }
-
-      const total = driftSamples.reduce((sum, value)=>sum + value, 0);
-      return total / driftSamples.length;
-    }
-
     async function hardSyncToExpectedTime(reason){
       if(hardSyncInProgress) return;
 
@@ -749,8 +728,7 @@
           audio.currentTime = expected;
           await waitForSeek();
           resetPlaybackRate();
-          resetDriftHistory();
-          suppressSyncFor(POST_HARD_SEEK_SUPPRESSION_MS);
+          suppressSyncFor(HARD_SEEK_SETTLE_MS);
 
           lastDriftSec = getCurrentDriftSec();
           setStatus(reason);
@@ -791,30 +769,19 @@
     function checkDriftStabilityFirst(){
       if(audio.paused || audio.ended || scheduledAnchorMs == null) return;
 
-      const rawDriftSec = getCurrentDriftSec();
-      const driftSec = getSmoothedDriftSec(rawDriftSec);
+      const driftSec = getCurrentDriftSec();
       lastDriftSec = driftSec;
 
       if(isSyncSuppressed() || hardSyncInProgress){
         resetPlaybackRate();
-        sustainedHardDriftCount = 0;
         setStatus("Settling…");
         updateTransport();
         return;
       }
 
       if(Math.abs(driftSec) >= HARD_SEEK_THRESHOLD_SEC){
-        sustainedHardDriftCount += 1;
-
-        if(sustainedHardDriftCount >= HARD_SEEK_CONFIRMATION_SAMPLES){
-          hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
-        }else{
-          resetPlaybackRate();
-          setStatus(`Confirming sync (${Math.round(driftSec * 1000)} ms)`);
-          updateTransport();
-        }
+        hardSyncToExpectedTime(`Seek correction (${Math.round(driftSec * 1000)} ms)`);
       }else{
-        sustainedHardDriftCount = 0;
         applyGentleRateCorrection(driftSec);
         updateTransport();
       }
@@ -869,7 +836,7 @@
           await waitForSeek();
         }
 
-        suppressSyncFor(LATE_JOIN_SYNC_SUPPRESSION_MS);
+        suppressSyncFor(LATE_JOIN_SETTLE_MS);
       }else{
         if(!hasEnoughToStartAt(offsetSec)){
           setStatus("Preparing audio…");
@@ -879,7 +846,7 @@
 
         audio.currentTime = offsetSec;
         await waitForSeek();
-        suppressSyncFor(STARTUP_SYNC_SUPPRESSION_MS);
+        suppressSyncFor(1500);
       }
 
       showPlayer();
@@ -905,7 +872,6 @@
       setStatus("Playing");
       setDebug(lastClockSyncDebug || "");
 
-      resetDriftHistory();
       lastDriftSec = getCurrentDriftSec();
 
       updateTransport();
@@ -989,7 +955,6 @@
       waitingForManualStart = false;
       startAttempted = false;
       lastDriftSec = 0;
-      resetDriftHistory();
       audio.volume = MAIN_VOLUME;
 
       setDebug("");
